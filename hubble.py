@@ -1117,18 +1117,57 @@ class Parser:
         line = self.current_token.line
         col = self.current_token.column
         
-        self.expect(TokenType.IMPORT)
-        
         items = []
         alias = None
+        module = None
         
         # from module import items
         if self.current_token.type == TokenType.FROM:
-            self.error("FROM syntax not yet implemented, use: import module")
+            self.advance()
+            module_token = self.expect(TokenType.IDENTIFIER)
+            module = module_token.value
+            
+            self.expect(TokenType.IMPORT)
+            
+            # from module import *
+            if self.current_token.type == TokenType.MULTIPLY:
+                self.advance()
+                items = ['*']
+            else:
+                # from module import item1, item2, item3
+                items.append(self.expect(TokenType.IDENTIFIER).value)
+                
+                while self.current_token and self.current_token.type == TokenType.COMMA:
+                    self.advance()
+                    items.append(self.expect(TokenType.IDENTIFIER).value)
+            
+            return ImportStatement(module=module, items=items, alias=None, line=line, column=col)
         
         # import module
-        module_token = self.expect(TokenType.IDENTIFIER)
-        module = module_token.value
+        self.expect(TokenType.IMPORT)
+        
+        # Support for module names with dots and hyphens (e.g., pygame-ce, numpy.random)
+        module_parts = []
+        module_parts.append(self.expect(TokenType.IDENTIFIER).value)
+        
+        # Handle dots (numpy.random) or hyphens (pygame-ce)
+        while self.current_token and self.current_token.type in (TokenType.DOT, TokenType.MINUS):
+            if self.current_token.type == TokenType.DOT:
+                module_parts.append('.')
+                self.advance()
+            elif self.current_token.type == TokenType.MINUS:
+                module_parts.append('-')
+                self.advance()
+            
+            if self.current_token.type == TokenType.IDENTIFIER:
+                module_parts.append(self.current_token.value)
+                self.advance()
+            elif self.current_token.type == TokenType.NUMBER:
+                # Handle cases like pygame-ce (where 'ce' might be tokenized)
+                module_parts.append(str(int(self.current_token.value)))
+                self.advance()
+        
+        module = ''.join(module_parts)
         
         # import module as alias
         if self.current_token and self.current_token.type == TokenType.AS:
@@ -1966,6 +2005,8 @@ class Interpreter:
     def __init__(self):
         self.global_env = Environment()
         self.current_env = self.global_env
+        self.module_manager = ModuleManager()
+        self.module_cache = {}  # Cache para prevenir imports circulares
         self.setup_builtins()
     
     def setup_builtins(self):
@@ -2769,62 +2810,857 @@ class Interpreter:
             return self.eval_expression(node.false_value)
     
     def eval_import(self, node: ImportStatement):
-        """Evaluate import statement"""
+        """Evaluate import statement with full support for .hbl, .py, .exe, .dll, .so, .dylib, and Python packages"""
         module_name = node.module
-        module_path = self.find_module(module_name)
         
+        # Check if it's a standard library module first
+        if module_name in self.module_manager.stdlib_modules:
+            module_obj = self.module_manager.stdlib_modules[module_name]
+            
+            # from module import items
+            if node.items:
+                if node.items == ['*']:
+                    # from module import * - import all
+                    for name, value in module_obj.items():
+                        if not name.startswith('_'):
+                            self.current_env.define(name, value)
+                else:
+                    # from module import item1, item2
+                    for item in node.items:
+                        if item in module_obj:
+                            self.current_env.define(item, module_obj[item])
+                        else:
+                            raise HubbleException(f"Cannot import '{item}' from module '{module_name}'")
+            else:
+                # import module or import module as alias
+                alias = node.alias or module_name
+                self.current_env.define(alias, module_obj)
+            
+            return None
+        
+        # Try to find module file (.hbl, .py, .exe, .dll, .so, .dylib)
+        module_path, module_type = self.find_module_with_type(module_name)
+        
+        # If not found as file, try to import as Python package (pip installed)
         if not module_path:
-            raise HubbleException(f"Cannot find module: {module_name}")
+            try:
+                module_obj = self.load_python_package(module_name)
+                
+                # from module import items
+                if node.items:
+                    if node.items == ['*']:
+                        # from module import * - import all non-private items
+                        for name, value in module_obj.items():
+                            if not name.startswith('_'):
+                                self.current_env.define(name, value)
+                    else:
+                        # from module import item1, item2, item3
+                        for item in node.items:
+                            if item in module_obj:
+                                self.current_env.define(item, module_obj[item])
+                            else:
+                                # Try to get from the actual module
+                                if '__module__' in module_obj:
+                                    try:
+                                        value = getattr(module_obj['__module__'], item)
+                                        self.current_env.define(item, value)
+                                    except AttributeError:
+                                        raise HubbleException(f"Cannot import '{item}' from module '{module_name}'")
+                                else:
+                                    raise HubbleException(f"Cannot import '{item}' from module '{module_name}'")
+                else:
+                    # import module or import module as alias
+                    alias = node.alias or module_name.replace('-', '_').replace('.', '_')
+                    self.current_env.define(alias, module_obj)
+                
+                return None
+            except HubbleException:
+                raise  # Re-raise Hubble exceptions
+            except Exception as e:
+                raise HubbleException(f"Cannot find module: {module_name}. Error: {e}")
         
-        # Load and execute module
-        with open(module_path, 'r', encoding='utf-8') as f:
-            source = f.read()
+        # Load module based on type
+        if module_type == 'hbl':
+            module_obj = self.load_hubble_module(module_path, module_name)
+        elif module_type == 'py':
+            module_obj = self.load_python_module(module_path, module_name)
+        elif module_type in ['dll', 'so', 'dylib', 'pyd']:
+            # Native libraries use the old native loader
+            module_obj = self.load_native_module(module_path, module_name, module_type)
+        else:
+            # Use the universal generic loader for everything else
+            module_obj = self.load_generic_module(module_path, module_name, module_type)
         
-        # Create module environment
-        module_env = Environment(parent=self.global_env)
+        # from module import items
+        if node.items:
+            if node.items == ['*']:
+                # from module import * - import all non-private items
+                for name, value in module_obj.items():
+                    if not name.startswith('_'):
+                        self.current_env.define(name, value)
+            else:
+                # from module import item1, item2, item3
+                for item in node.items:
+                    if item in module_obj:
+                        self.current_env.define(item, module_obj[item])
+                    else:
+                        raise HubbleException(f"Cannot import '{item}' from module '{module_name}'")
+        else:
+            # import module or import module as alias
+            alias = node.alias or module_name.replace('-', '_').replace('.', '_')
+            self.current_env.define(alias, module_obj)
         
-        # Parse and execute module
-        lexer = Lexer(source)
-        tokens = lexer.tokenize()
-        parser = Parser(tokens)
-        program = parser.parse()
-        
-        interpreter = Interpreter()
-        interpreter.current_env = module_env
-        interpreter.global_env = self.global_env
-        
-        try:
-            for statement in program.statements:
-                interpreter.eval_statement(statement)
-        except ReturnException:
-            pass
-        
-        # Import module into current environment
-        alias = node.alias or module_name
-        
-        # Create module object with exported variables
-        module_obj = {
-            name: value
-            for name, value in module_env.variables.items()
-            if not name.startswith('_')
-        }
-        
-        self.current_env.define(alias, module_obj)
         return None
     
+    def load_hubble_module(self, module_path: str, module_name: str) -> dict:
+        """Load .hbl Hubble module with circular import detection"""
+        # Normalizar o caminho do módulo
+        normalized_path = str(Path(module_path).resolve())
+        
+        # Verificar se o módulo já está no cache
+        if normalized_path in self.module_cache:
+            return self.module_cache[normalized_path]
+        
+        # Marcar módulo como "sendo carregado" para detectar imports circulares
+        if normalized_path in getattr(self, '_loading_modules', set()):
+            raise HubbleException(f"Circular import detected: {module_name}")
+        
+        # Inicializar set de módulos sendo carregados se não existir
+        if not hasattr(self, '_loading_modules'):
+            self._loading_modules = set()
+        
+        self._loading_modules.add(normalized_path)
+        
+        try:
+            with open(module_path, 'r', encoding='utf-8') as f:
+                source = f.read()
+            
+            # Create module environment
+            module_env = Environment(parent=self.global_env)
+            
+            # Parse and execute module
+            lexer = Lexer(source)
+            tokens = lexer.tokenize()
+            parser = Parser(tokens)
+            program = parser.parse()
+            
+            interpreter = Interpreter()
+            interpreter.current_env = module_env
+            interpreter.global_env = self.global_env
+            interpreter.module_manager = self.module_manager
+            interpreter.module_cache = self.module_cache  # Compartilhar cache
+            interpreter._loading_modules = self._loading_modules  # Compartilhar set
+            
+            try:
+                for statement in program.statements:
+                    interpreter.eval_statement(statement)
+            except ReturnException:
+                pass
+            
+            # Create module object with exported variables
+            module_obj = {
+                name: value
+                for name, value in module_env.variables.items()
+                if not name.startswith('_')
+            }
+            
+            # Adicionar ao cache antes de remover do set
+            self.module_cache[normalized_path] = module_obj
+            
+            return module_obj
+            
+        finally:
+            # Remover do set de módulos sendo carregados
+            self._loading_modules.discard(normalized_path)
+    
+    def load_python_module(self, module_path: str, module_name: str) -> dict:
+        """Load .py Python module with caching"""
+        # Normalizar o caminho do módulo
+        normalized_path = str(Path(module_path).resolve())
+        
+        # Verificar se o módulo já está no cache
+        if normalized_path in self.module_cache:
+            return self.module_cache[normalized_path]
+        
+        import importlib.util
+        import types
+        
+        try:
+            # Load Python module dynamically
+            spec = importlib.util.spec_from_file_location(module_name, module_path)
+            if spec is None or spec.loader is None:
+                raise HubbleException(f"Cannot load Python module: {module_name}")
+            
+            py_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(py_module)
+            
+            # Extract public attributes
+            module_obj = {}
+            for attr_name in dir(py_module):
+                if not attr_name.startswith('_'):
+                    attr = getattr(py_module, attr_name)
+                    # Include functions, classes, modules, and simple types
+                    if callable(attr) or isinstance(attr, (int, float, str, bool, list, dict, type(None), types.ModuleType)):
+                        module_obj[attr_name] = attr
+            
+            # Adicionar ao cache
+            self.module_cache[normalized_path] = module_obj
+            
+            return module_obj
+        
+        except Exception as e:
+            raise HubbleException(f"Error loading Python module '{module_name}': {e}")
+    
+    def load_python_package(self, module_name: str) -> dict:
+        """Load Python package from system (pip installed packages)"""
+        # Verificar se já está no cache
+        cache_key = f"__python_package__{module_name}"
+        if cache_key in self.module_cache:
+            return self.module_cache[cache_key]
+        
+        import importlib
+        import types
+        
+        try:
+            # Try to import the Python package
+            py_module = importlib.import_module(module_name)
+            
+            # Extract public attributes
+            module_obj = {}
+            for attr_name in dir(py_module):
+                if not attr_name.startswith('_'):
+                    try:
+                        attr = getattr(py_module, attr_name)
+                        # Include everything that's accessible
+                        module_obj[attr_name] = attr
+                    except:
+                        # Skip attributes that can't be accessed
+                        pass
+            
+            # Adicionar o próprio módulo para permitir acesso completo
+            module_obj['__module__'] = py_module
+            
+            # Adicionar ao cache
+            self.module_cache[cache_key] = module_obj
+            
+            return module_obj
+        
+        except ImportError as e:
+            raise HubbleException(f"Cannot import Python package '{module_name}': {e}. Make sure it's installed with pip.")
+        except Exception as e:
+            raise HubbleException(f"Error loading Python package '{module_name}': {e}")
+    
+    def load_native_module(self, module_path: str, module_name: str, module_type: str) -> dict:
+        """Load native module (.exe, .dll, .so, .dylib) with full .exe support"""
+        import ctypes
+        import platform
+        
+        try:
+            module_obj = {}
+            
+            if module_type == 'exe':
+                # Advanced .exe support - can be used as library or executable
+                module_obj['path'] = module_path
+                
+                # Method 1: Execute as process
+                def run_exe(*args):
+                    import subprocess
+                    cmd = [module_path] + [str(arg) for arg in args]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    return {
+                        'stdout': result.stdout,
+                        'stderr': result.stderr,
+                        'returncode': result.returncode,
+                        'success': result.returncode == 0
+                    }
+                
+                module_obj['run'] = run_exe
+                module_obj['execute'] = run_exe
+                
+                # Method 2: Try to load as DLL/library (Windows only)
+                if sys.platform == 'win32':
+                    try:
+                        # Try to load .exe as a library (some .exe files export functions)
+                        lib = ctypes.CDLL(module_path)
+                        module_obj['_lib'] = lib
+                        
+                        # Add helper to call exported functions
+                        def call_function(func_name, *args, **kwargs):
+                            """Call an exported function from the .exe"""
+                            if not hasattr(lib, func_name):
+                                raise HubbleException(f"Function '{func_name}' not found in {module_name}")
+                            
+                            func = getattr(lib, func_name)
+                            
+                            if 'restype' in kwargs:
+                                func.restype = kwargs['restype']
+                            if 'argtypes' in kwargs:
+                                func.argtypes = kwargs['argtypes']
+                            
+                            return func(*args)
+                        
+                        module_obj['call'] = call_function
+                        module_obj['get_function'] = lambda name: getattr(lib, name)
+                        
+                        # Add ctypes for type conversion
+                        module_obj['c_int'] = ctypes.c_int
+                        module_obj['c_float'] = ctypes.c_float
+                        module_obj['c_double'] = ctypes.c_double
+                        module_obj['c_char_p'] = ctypes.c_char_p
+                        module_obj['c_wchar_p'] = ctypes.c_wchar_p
+                        module_obj['c_void_p'] = ctypes.c_void_p
+                        module_obj['c_bool'] = ctypes.c_bool
+                        module_obj['c_size_t'] = ctypes.c_size_t
+                        module_obj['POINTER'] = ctypes.POINTER
+                        module_obj['byref'] = ctypes.byref
+                        module_obj['Structure'] = ctypes.Structure
+                        
+                        module_obj['_is_library'] = True
+                    except (OSError, Exception):
+                        # .exe doesn't export functions, only executable mode available
+                        module_obj['_is_library'] = False
+                        pass
+                
+                # Method 3: Execute with pipe communication
+                def execute_with_input(stdin_data="", *args):
+                    """Execute .exe with stdin input"""
+                    import subprocess
+                    cmd = [module_path] + [str(arg) for arg in args]
+                    result = subprocess.run(
+                        cmd, 
+                        input=stdin_data, 
+                        capture_output=True, 
+                        text=True
+                    )
+                    return {
+                        'stdout': result.stdout,
+                        'stderr': result.stderr,
+                        'returncode': result.returncode,
+                        'success': result.returncode == 0
+                    }
+                
+                module_obj['execute_with_input'] = execute_with_input
+                
+                # Method 4: Execute async (non-blocking)
+                def run_async(*args):
+                    """Run .exe asynchronously"""
+                    import subprocess
+                    cmd = [module_path] + [str(arg) for arg in args]
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True
+                    )
+                    return {
+                        'process': process,
+                        'pid': process.pid,
+                        'wait': lambda: process.wait(),
+                        'poll': lambda: process.poll(),
+                        'kill': lambda: process.kill(),
+                        'terminate': lambda: process.terminate(),
+                        'communicate': lambda: process.communicate()
+                    }
+                
+                module_obj['run_async'] = run_async
+                module_obj['spawn'] = run_async
+                
+                # Method 5: Check if .exe is running
+                def is_running():
+                    """Check if process is running"""
+                    import psutil
+                    try:
+                        exe_name = Path(module_path).name
+                        for proc in psutil.process_iter(['name']):
+                            if proc.info['name'] == exe_name:
+                                return True
+                        return False
+                    except:
+                        return False
+                
+                try:
+                    import psutil
+                    module_obj['is_running'] = is_running
+                except ImportError:
+                    pass
+                
+            elif module_type in ['dll', 'so', 'dylib', 'pyd']:
+                # Load shared library
+                try:
+                    if module_type == 'dll' or module_type == 'pyd':
+                        lib = ctypes.CDLL(module_path)
+                    elif module_type == 'so':
+                        lib = ctypes.CDLL(module_path)
+                    elif module_type == 'dylib':
+                        lib = ctypes.CDLL(module_path)
+                    
+                    module_obj['_lib'] = lib
+                    module_obj['path'] = module_path
+                    
+                    # Add helper function to call library functions
+                    def call_function(func_name, *args, **kwargs):
+                        """Call a function from the native library"""
+                        if not hasattr(lib, func_name):
+                            raise HubbleException(f"Function '{func_name}' not found in library")
+                        
+                        func = getattr(lib, func_name)
+                        
+                        if 'restype' in kwargs:
+                            func.restype = kwargs['restype']
+                        if 'argtypes' in kwargs:
+                            func.argtypes = kwargs['argtypes']
+                        
+                        return func(*args)
+                    
+                    module_obj['call'] = call_function
+                    module_obj['get_function'] = lambda name: getattr(lib, name)
+                    
+                    # Add ctypes types for convenience
+                    module_obj['c_int'] = ctypes.c_int
+                    module_obj['c_uint'] = ctypes.c_uint
+                    module_obj['c_long'] = ctypes.c_long
+                    module_obj['c_ulong'] = ctypes.c_ulong
+                    module_obj['c_longlong'] = ctypes.c_longlong
+                    module_obj['c_ulonglong'] = ctypes.c_ulonglong
+                    module_obj['c_float'] = ctypes.c_float
+                    module_obj['c_double'] = ctypes.c_double
+                    module_obj['c_char'] = ctypes.c_char
+                    module_obj['c_char_p'] = ctypes.c_char_p
+                    module_obj['c_wchar'] = ctypes.c_wchar
+                    module_obj['c_wchar_p'] = ctypes.c_wchar_p
+                    module_obj['c_void_p'] = ctypes.c_void_p
+                    module_obj['c_bool'] = ctypes.c_bool
+                    module_obj['c_byte'] = ctypes.c_byte
+                    module_obj['c_ubyte'] = ctypes.c_ubyte
+                    module_obj['c_short'] = ctypes.c_short
+                    module_obj['c_ushort'] = ctypes.c_ushort
+                    module_obj['c_size_t'] = ctypes.c_size_t
+                    module_obj['c_ssize_t'] = ctypes.c_ssize_t
+                    module_obj['POINTER'] = ctypes.POINTER
+                    module_obj['pointer'] = ctypes.pointer
+                    module_obj['byref'] = ctypes.byref
+                    module_obj['Structure'] = ctypes.Structure
+                    module_obj['Union'] = ctypes.Union
+                    module_obj['Array'] = ctypes.Array
+                    module_obj['sizeof'] = ctypes.sizeof
+                    module_obj['cast'] = ctypes.cast
+                    module_obj['string_at'] = ctypes.string_at
+                    module_obj['wstring_at'] = ctypes.wstring_at
+                    
+                except OSError as e:
+                    raise HubbleException(f"Cannot load native library '{module_path}': {e}")
+            
+            return module_obj
+        
+        except Exception as e:
+            raise HubbleException(f"Error loading native module '{module_name}': {e}")
+        """Load any generic file as a module - universal loader"""
+        # Normalizar o caminho do módulo
+        normalized_path = str(Path(module_path).resolve())
+        
+        # Verificar se o módulo já está no cache
+        if normalized_path in self.module_cache:
+            return self.module_cache[normalized_path]
+        
+        try:
+            module_obj = {}
+            
+            # For script files (bat, sh, cmd, etc.), create execution wrapper
+            if file_type in ['bat', 'cmd', 'sh', 'exe']:
+                def run_script(*args):
+                    import subprocess
+                    cmd = [module_path] + [str(arg) for arg in args]
+                    result = subprocess.run(cmd, capture_output=True, text=True, shell=(file_type in ['bat', 'cmd']))
+                    return {
+                        'stdout': result.stdout,
+                        'stderr': result.stderr,
+                        'returncode': result.returncode,
+                        'success': result.returncode == 0
+                    }
+                
+                module_obj['run'] = run_script
+                module_obj['execute'] = run_script
+                module_obj['path'] = module_path
+            
+            # For text-based script files that might be other languages
+            elif file_type in ['js', 'mjs', 'lua', 'rb', 'pl']:
+                # Create an executor for the specific interpreter
+                interpreters = {
+                    'js': ['node'],
+                    'mjs': ['node'],
+                    'lua': ['lua'],
+                    'rb': ['ruby'],
+                    'pl': ['perl']
+                }
+                
+                interpreter = interpreters.get(file_type, [])
+                
+                def run_with_interpreter(*args):
+                    import subprocess
+                    cmd = interpreter + [module_path] + [str(arg) for arg in args]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    return {
+                        'stdout': result.stdout,
+                        'stderr': result.stderr,
+                        'returncode': result.returncode,
+                        'success': result.returncode == 0
+                    }
+                
+                module_obj['run'] = run_with_interpreter
+                module_obj['execute'] = run_with_interpreter
+                module_obj['path'] = module_path
+                module_obj['interpreter'] = interpreter
+            
+            # For Java files
+            elif file_type in ['jar', 'class']:
+                def run_java(*args):
+                    import subprocess
+                    if file_type == 'jar':
+                        cmd = ['java', '-jar', module_path] + [str(arg) for arg in args]
+                    else:
+                        # For .class files, need to run java with classpath
+                        cmd = ['java', '-cp', str(Path(module_path).parent), Path(module_path).stem] + [str(arg) for arg in args]
+                    
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    return {
+                        'stdout': result.stdout,
+                        'stderr': result.stderr,
+                        'returncode': result.returncode,
+                        'success': result.returncode == 0
+                    }
+                
+                module_obj['run'] = run_java
+                module_obj['execute'] = run_java
+                module_obj['path'] = module_path
+            
+            # For Python packages (zip, egg, whl)
+            elif file_type in ['zip', 'egg', 'whl']:
+                # Try to add to Python path and import
+                import sys
+                if module_path not in sys.path:
+                    sys.path.insert(0, module_path)
+                
+                try:
+                    import importlib
+                    # Try to import the package
+                    pkg = importlib.import_module(Path(module_path).stem)
+                    for attr_name in dir(pkg):
+                        if not attr_name.startswith('_'):
+                            try:
+                                module_obj[attr_name] = getattr(pkg, attr_name)
+                            except:
+                                pass
+                except:
+                    # If can't import, just provide path access
+                    module_obj['path'] = module_path
+                    module_obj['__package__'] = True
+            
+            # For compiled Python files
+            elif file_type in ['pyc', 'pyo']:
+                import importlib.util
+                try:
+                    spec = importlib.util.spec_from_file_location(module_name, module_path)
+                    if spec and spec.loader:
+                        py_module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(py_module)
+                        
+                        for attr_name in dir(py_module):
+                            if not attr_name.startswith('_'):
+                                try:
+                                    module_obj[attr_name] = getattr(py_module, attr_name)
+                                except:
+                                    pass
+                except:
+                    module_obj['path'] = module_path
+            
+            # For unknown file types, try to read as text or provide raw access
+            else:
+                try:
+                    # Try to read as text
+                    with open(module_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    module_obj['content'] = content
+                    module_obj['read'] = lambda: content
+                except:
+                    # Binary file, provide raw read function
+                    def read_binary():
+                        with open(module_path, 'rb') as f:
+                            return f.read()
+                    module_obj['read'] = read_binary
+                
+                module_obj['path'] = module_path
+                
+                # Try to execute as script if possible
+                def try_execute(*args):
+                    import subprocess
+                    try:
+                        cmd = [module_path] + [str(arg) for arg in args]
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        return {
+                            'stdout': result.stdout,
+                            'stderr': result.stderr,
+                            'returncode': result.returncode,
+                            'success': result.returncode == 0
+                        }
+                    except Exception as e:
+                        return {
+                            'error': str(e),
+                            'success': False
+                        }
+                
+                module_obj['execute'] = try_execute
+            
+            # Always provide basic file info
+            module_obj['__file__'] = module_path
+            module_obj['__type__'] = file_type
+            module_obj['__name__'] = module_name
+            
+            # Cache the module
+            self.module_cache[normalized_path] = module_obj
+            
+            return module_obj
+        
+        except Exception as e:
+            raise HubbleException(f"Error loading module '{module_name}' from '{module_path}': {e}")
+        """Load native module (.exe, .dll, .so, .dylib)"""
+        import ctypes
+        import platform
+        
+        try:
+            module_obj = {}
+            
+            if module_type == 'exe':
+                # For .exe files, create a wrapper that executes the program
+                def run_exe(*args):
+                    import subprocess
+                    cmd = [module_path] + [str(arg) for arg in args]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    return {
+                        'stdout': result.stdout,
+                        'stderr': result.stderr,
+                        'returncode': result.returncode,
+                        'success': result.returncode == 0
+                    }
+                
+                module_obj['run'] = run_exe
+                module_obj['path'] = module_path
+                module_obj['execute'] = run_exe
+                
+            elif module_type in ['dll', 'so', 'dylib']:
+                # Load shared library
+                try:
+                    if module_type == 'dll':
+                        lib = ctypes.CDLL(module_path)
+                    elif module_type == 'so':
+                        lib = ctypes.CDLL(module_path)
+                    elif module_type == 'dylib':
+                        lib = ctypes.CDLL(module_path)
+                    
+                    # Create wrapper object
+                    module_obj['_lib'] = lib
+                    module_obj['path'] = module_path
+                    
+                    # Add helper function to call library functions
+                    def call_function(func_name, *args, **kwargs):
+                        """Call a function from the native library"""
+                        if not hasattr(lib, func_name):
+                            raise HubbleException(f"Function '{func_name}' not found in library")
+                        
+                        func = getattr(lib, func_name)
+                        
+                        # Setup return type if specified
+                        if 'restype' in kwargs:
+                            func.restype = kwargs['restype']
+                        
+                        # Setup argument types if specified
+                        if 'argtypes' in kwargs:
+                            func.argtypes = kwargs['argtypes']
+                        
+                        return func(*args)
+                    
+                    module_obj['call'] = call_function
+                    module_obj['get_function'] = lambda name: getattr(lib, name)
+                    
+                    # Add ctypes types for convenience
+                    module_obj['c_int'] = ctypes.c_int
+                    module_obj['c_float'] = ctypes.c_float
+                    module_obj['c_double'] = ctypes.c_double
+                    module_obj['c_char_p'] = ctypes.c_char_p
+                    module_obj['c_void_p'] = ctypes.c_void_p
+                    module_obj['c_bool'] = ctypes.c_bool
+                    module_obj['POINTER'] = ctypes.POINTER
+                    
+                except OSError as e:
+                    raise HubbleException(f"Cannot load native library '{module_path}': {e}")
+            
+            return module_obj
+        
+        except Exception as e:
+            raise HubbleException(f"Error loading native module '{module_name}': {e}")
+    
+    def find_module_with_type(self, name: str) -> Tuple[Optional[str], Optional[str]]:
+        """Find module file with support for .hbl, .py, .exe, .dll, .so, .dylib - ANY FILE TYPE"""
+        # Support for package.submodule syntax
+        parts = name.split('.')
+        base_name = name.replace(".", "/")
+        
+        # Define ALL possible extensions - not limited!
+        # Standard extensions
+        extensions = ['.hbl', '.py']
+        
+        # Platform-specific binary extensions
+        if sys.platform == 'win32':
+            extensions.extend(['.exe', '.dll', '.pyd', '.pyw'])
+        elif sys.platform == 'darwin':
+            extensions.extend(['.dylib', '.so'])
+        else:  # Linux and other Unix-like
+            extensions.extend(['.so'])
+        
+        # Additional extensions that might be modules
+        # Python compiled, libraries, scripts, etc.
+        extensions.extend([
+            '.pyc', '.pyo', '.pyi',  # Python bytecode and stubs
+            '.zip', '.egg', '.whl',   # Python packages
+            '.js', '.mjs',            # JavaScript (if needed)
+            '.lua',                   # Lua scripts
+            '.rb',                    # Ruby scripts
+            '.pl',                    # Perl scripts
+            '.sh', '.bat', '.cmd',    # Shell scripts
+            '.jar',                   # Java archives
+            '.class',                 # Java classes
+        ])
+        
+        search_paths = []
+        
+        # 1. Check current directory and subdirectories (HIGHEST PRIORITY)
+        search_paths.append(Path.cwd())
+        
+        # 2. Check standard library
+        stdlib_dir = Path(__file__).parent / 'stdlib'
+        if stdlib_dir.exists():
+            search_paths.append(stdlib_dir)
+        
+        # 3. Check HUBBLE_PATH environment variable
+        hubble_path = os.environ.get('HUBBLE_PATH', '')
+        if hubble_path:
+            for path in hubble_path.split(os.pathsep):
+                search_paths.append(Path(path))
+        
+        # Search for module file with known extensions
+        for search_path in search_paths:
+            for ext in extensions:
+                # Direct file match
+                module_file = search_path / f"{base_name}{ext}"
+                if module_file.exists():
+                    return str(module_file), ext[1:]  # Return path and extension without dot
+                
+                # Simple name match
+                simple_file = search_path / f"{name}{ext}"
+                if simple_file.exists():
+                    return str(simple_file), ext[1:]
+        
+        # NEW: Search for ANY file with the exact name (no extension requirement)
+        # This allows importing files like "mylibrary" without extension
+        for search_path in search_paths:
+            # Try exact name match
+            exact_file = search_path / name
+            if exact_file.exists() and exact_file.is_file():
+                # Detect type by trying to read it
+                file_type = self.detect_file_type(str(exact_file))
+                if file_type:
+                    return str(exact_file), file_type
+            
+            # Try with path separators
+            path_file = search_path / base_name
+            if path_file.exists() and path_file.is_file():
+                file_type = self.detect_file_type(str(path_file))
+                if file_type:
+                    return str(path_file), file_type
+        
+        # NEW: Wildcard search - find ANY file starting with the module name
+        for search_path in search_paths:
+            if search_path.exists():
+                try:
+                    # Search for files matching the pattern
+                    for file_path in search_path.glob(f"{name}*"):
+                        if file_path.is_file():
+                            # Check if it's a valid module file
+                            ext = file_path.suffix
+                            if ext:
+                                return str(file_path), ext[1:]
+                            else:
+                                # File without extension, try to detect type
+                                file_type = self.detect_file_type(str(file_path))
+                                if file_type:
+                                    return str(file_path), file_type
+                except:
+                    pass
+        
+        # Check for package __init__ file
+        if len(parts) > 1:
+            for search_path in search_paths:
+                package_init = search_path / parts[0] / '__init__.hbl'
+                if package_init.exists():
+                    return str(package_init), 'hbl'
+                
+                # Also check for Python __init__.py
+                package_init_py = search_path / parts[0] / '__init__.py'
+                if package_init_py.exists():
+                    return str(package_init_py), 'py'
+        
+        return None, None
+    
+    def detect_file_type(self, file_path: str) -> Optional[str]:
+        """Detect file type by reading its content or checking attributes"""
+        try:
+            # Check if it's executable
+            if os.access(file_path, os.X_OK):
+                if sys.platform == 'win32':
+                    return 'exe'
+                else:
+                    # Unix executable, treat as shell script or binary
+                    return 'exe'
+            
+            # Try to detect by reading first few bytes
+            with open(file_path, 'rb') as f:
+                header = f.read(100)
+                
+                # Check for Python file
+                if header.startswith(b'#!') and b'python' in header:
+                    return 'py'
+                
+                # Check for shell script
+                if header.startswith(b'#!/bin/sh') or header.startswith(b'#!/bin/bash'):
+                    return 'exe'
+                
+                # Check for text file that might be Python
+                try:
+                    header_text = header.decode('utf-8')
+                    if 'import ' in header_text or 'def ' in header_text or 'class ' in header_text:
+                        return 'py'
+                    # Check for Hubble syntax
+                    if 'func ' in header_text or 'var ' in header_text or 'end' in header_text:
+                        return 'hbl'
+                except:
+                    pass
+                
+                # Check for binary library signatures
+                if header.startswith(b'MZ'):  # Windows PE
+                    return 'dll'
+                if header.startswith(b'\x7fELF'):  # Linux ELF
+                    return 'so'
+                if b'Mach-O' in header or header.startswith(b'\xca\xfe\xba\xbe'):  # macOS Mach-O
+                    return 'dylib'
+            
+            # Default: try to treat as Python module
+            return 'py'
+        except:
+            return None
+    
     def find_module(self, name: str) -> Optional[str]:
-        """Find module file"""
-        # Check standard library
-        stdlib_path = Path(__file__).parent / 'stdlib' / f'{name}.hbl'
-        if stdlib_path.exists():
-            return str(stdlib_path)
-        
-        # Check current directory
-        local_path = Path.cwd() / f'{name}.hbl'
-        if local_path.exists():
-            return str(local_path)
-        
-        return None
+        """Find module file (legacy method, kept for compatibility)"""
+        module_path, _ = self.find_module_with_type(name)
+        return module_path
     
     def eval_try_statement(self, node: TryStatement):
         """Evaluate try-catch-finally"""
@@ -3322,272 +4158,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# ============================================================================
-# EXAMPLE STANDARD LIBRARY MODULES
-# ============================================================================
-
-"""
-Example: stdlib/math.hbl
-
-func square(x)
-    return x * x
-end
-
-func cube(x)
-    return x * x * x
-end
-
-func is_even(n)
-    return n % 2 == 0
-end
-
-func is_odd(n)
-    return n % 2 != 0
-end
-
-func factorial(n)
-    if n <= 1 then
-        return 1
-    end
-    return n * factorial(n - 1)
-end
-
-func fibonacci(n)
-    if n <= 1 then
-        return n
-    end
-    return fibonacci(n - 1) + fibonacci(n - 2)
-end
-
-func gcd(a, b)
-    while b != 0 do
-        var temp = b
-        b = a % b
-        a = temp
-    end
-    return a
-end
-
-func lcm(a, b)
-    return (a * b) / gcd(a, b)
-end
-
-func clamp(value, min_val, max_val)
-    return max(min_val, min(max_val, value))
-end
-
-func lerp(start, end, t)
-    return start + (end - start) * t
-end
-"""
-
-"""
-Example: Hello World (hello.hbl)
-
-print("Hello, World!")
-"""
-
-"""
-Example: Variables and Functions (variables.hbl)
-
-var name = "Alice"
-var age = 25
-const PI = 3.14159
-
-func greet(name)
-    return "Hello, " + name + "!"
-end
-
-print(greet(name))
-print("Age:", age)
-print("PI:", PI)
-"""
-
-"""
-Example: Control Flow (control.hbl)
-
-var x = 10
-
-if x > 5 then
-    print("x is greater than 5")
-elif x == 5 then
-    print("x is 5")
-else
-    print("x is less than 5")
-end
-
-var i = 0
-while i < 5 do
-    print("Count:", i)
-    i += 1
-end
-
-for num in range(1, 6) do
-    print("Number:", num)
-end
-"""
-
-"""
-Example: Arrays and Dicts (collections.hbl)
-
-var numbers = [1, 2, 3, 4, 5]
-push(numbers, 6)
-print("Numbers:", numbers)
-print("Length:", len(numbers))
-
-var person = {
-    "name": "Bob",
-    "age": 30,
-    "city": "New York"
-}
-
-print("Person:", person)
-print("Name:", person["name"])
-
-for num in numbers do
-    print("Squared:", num * num)
-end
-"""
-
-"""
-Example: Classes (classes.hbl)
-
-class Animal
-    var name = ""
-    var age = 0
-    
-    func init(n, a)
-        this.name = n
-        this.age = a
-    end
-    
-    func speak()
-        print(this.name + " makes a sound")
-    end
-    
-    func info()
-        print("Name: " + this.name + ", Age: " + str(this.age))
-    end
-end
-
-class Dog < Animal
-    func speak()
-        print(this.name + " barks!")
-    end
-end
-
-var dog = new Dog("Rex", 3)
-dog.speak()
-dog.info()
-"""
-
-"""
-Example: Lambda and Higher-Order Functions (lambda.hbl)
-
-var numbers = [1, 2, 3, 4, 5]
-
-var doubled = map(lambda x: x * 2, numbers)
-print("Doubled:", doubled)
-
-var evens = filter(lambda x: x % 2 == 0, numbers)
-print("Evens:", evens)
-
-var sum_all = reduce(lambda a, b: a + b, numbers)
-print("Sum:", sum_all)
-
-func apply_twice(f, x)
-    return f(f(x))
-end
-
-var increment = lambda x: x + 1
-print("Applied twice:", apply_twice(increment, 5))
-"""
-
-"""
-Example: Exception Handling (exceptions.hbl)
-
-try
-    var x = 10 / 0
-catch err
-    print("Error caught:", err)
-finally
-    print("Cleanup code here")
-end
-
-func safe_divide(a, b)
-    try
-        return a / b
-    catch err
-        print("Cannot divide by zero")
-        return null
-    end
-end
-
-print(safe_divide(10, 2))
-print(safe_divide(10, 0))
-"""
-
-"""
-Example: Pattern Matching (match.hbl)
-
-func describe_number(n)
-    match n
-        case 0:
-            print("Zero")
-        case 1:
-            print("One")
-        case 2:
-            print("Two")
-        default:
-            print("Other number:", n)
-    end
-end
-
-describe_number(0)
-describe_number(1)
-describe_number(42)
-"""
-
-"""
-Example: File I/O (files.hbl)
-
-write_file("test.txt", "Hello from Hubble!")
-var content = read_file("test.txt")
-print("File content:", content)
-
-append_file("test.txt", "\nSecond line")
-content = read_file("test.txt")
-print("Updated content:", content)
-"""
-
-"""
-Example: Recursive Functions (recursion.hbl)
-
-func factorial(n)
-    if n <= 1 then
-        return 1
-    end
-    return n * factorial(n - 1)
-end
-
-func fibonacci(n)
-    if n <= 1 then
-        return n
-    end
-    return fibonacci(n - 1) + fibonacci(n - 2)
-end
-
-print("Factorial of 5:", factorial(5))
-print("Fibonacci of 10:", fibonacci(10))
-
-func sum_range(start, end)
-    if start > end then
-        return 0
-    end
-    return start + sum_range(start + 1, end)
-end
-
-print("Sum 1 to 10:", sum_range(1, 10))
-"""
