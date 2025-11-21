@@ -2884,8 +2884,8 @@ class Interpreter:
             module_obj = self.load_hubble_module(module_path, module_name)
         elif module_type == 'py':
             module_obj = self.load_python_module(module_path, module_name)
-        elif module_type in ['dll', 'so', 'dylib', 'pyd']:
-            # Native libraries use the old native loader
+        elif module_type in ['dll', 'so', 'dylib', 'pyd', 'exe']:
+            # Native libraries AND executables use the enhanced native loader
             module_obj = self.load_native_module(module_path, module_name, module_type)
         else:
             # Use the universal generic loader for everything else
@@ -4154,7 +4154,18 @@ def main():
             cli.run_file(arg)
     else:
         cli.show_help()
-
+import sys
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        caminho = sys.argv[1]
+        with open(caminho, "r", encoding="utf-8") as f:
+            source = f.read()
+        tokens = Lexer(source).tokenize()
+        ast = Parser(tokens).parse()
+        Interpreter().interpret(ast)
+    else:
+        print("Uso: hubble.exe arquivo.hb")
+
+
+
